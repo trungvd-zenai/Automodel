@@ -754,6 +754,11 @@ world size; on 2 GPUs (EP2) multiply it by 4.
 | `affine/check_export.py` | rung 9 |
 | `affine/export_hf_helper.py` | offline consolidation used by `export_hf.sh` |
 | `affine/dump_sample.py` | dump one training-ready sample with the supervised span marked |
+| `SETUP_2xB300.md` | bare RunPod image → working packed run: every environment error hit on 2026-09-21 and its fix, the version set that came out, memory/speed per batch size, and how not to collide two jobs on one box |
+| `PACKING_GPU_FIXES.md` | what broke when packing first ran on a GPU (int32 `cu_seqlens`, 2-D TE `thd` output), why the parity gate had to change (`--perturb-neighbors`), the end-to-end check, the two procedure mistakes, and the measured 2.7–3.8× over the unpacked baseline |
+| `b300/` | the provisioning and run scripts the setup doc refers to |
+| `affine/check_packed_e2e.py` | per-document CE, real model + real packer, packed vs solo — the floor is document 1 |
+| `affine/make_short_subset.py` | short-row corpus for the fast smoke rung; `pack_size` cannot be lowered on the full corpus |
 | `PACKING_BRINGUP.md` | how to qualify the packing change on 2 GPUs before a 4-node run: the TE fused-attention gate, the parity test, the smoke checks, and the step-schedule recomputation |
 | `affine/check_packed_parity.py` | packed-vs-standalone parity per document — the gate for §13.5 |
 | `affine/check_sampler.py` | what `LengthGroupedSampler` actually yields, epoch over epoch — shows the frozen batch membership of §13.3; dead for the packed recipe |
