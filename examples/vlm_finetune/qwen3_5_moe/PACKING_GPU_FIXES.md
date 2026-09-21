@@ -115,10 +115,13 @@ Packed, `lbs 4 / gbs 32`, LR 5e-5 constant after a 1-step warmup, full AC, v5_13
 |---|---|
 | packs | 128,575 rows → 14,644 at 100.0% estimated utilization |
 | TE | `Selected backend = FusedAttention (sub-backend 1)`, `thd_thd_thd`, `head_dim 256` |
-| loss | 0.818 (step 0) → 0.54–0.56 by step 15–20, grad norm 5.96 → ~1.0 |
-| supervised tokens/step | 65k–96k (mean 78k) — last-turn masking intact under packing |
-| memory | 193 GiB torch steady, ~226 GB `nvidia-smi` |
-| speed | **68 s/step, 19,200 real tok/s**, 1.31 M real tokens/step |
+| loss | **0.818 → 0.487** over 50 steps; first-10 mean 0.759, last-10 mean 0.513; final validation **0.472**; sd of the last 20 steps 0.025 |
+| grad norm | 5.96 → 0.84; below the 1.0 clip from step ~16 on (last-10 mean 0.97, sd 0.18) |
+| supervised tokens/step | 64k–96k (mean 78k) — last-turn masking intact under packing |
+| memory | 193 GiB torch steady, **229 GB `nvidia-smi` peak** of 275 |
+| speed | **66.7 s/step, 19,500 real tok/s**, 1.31 M real tokens/step, flat over the run |
+
+Per-step series: `logs/gbs32_50_steps.csv`; rendered curves: `logs/gbs32_50_curves.html`.
 
 Against the unpacked baseline on the same box (v4 bring-up, lbs 2: ~64 s/step, 4,800–7,000
 real tok/s): same step time, 3.5× the tokens — **2.7–3.8× faster**, and a lower bound, since
