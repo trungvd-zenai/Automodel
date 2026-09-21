@@ -144,6 +144,24 @@ def main() -> None:
     parser.add_argument("--doc-lens", type=int, nargs="+", default=[37, 61, 19])
     parser.add_argument("--pad", type=int, default=5, help="Trailing padding tokens in the pack.")
     parser.add_argument("--atol", type=float, default=None, help="Defaults by dtype.")
+    parser.add_argument(
+        "--perturb-neighbors",
+        action="store_true",
+        help="The decisive leak test. Re-run the SAME pack with every other document's "
+        "hidden states re-randomized, holding all lengths and offsets fixed, and require the "
+        "document under test to be bit-identical. Packed-vs-solo conflates leakage with "
+        "arithmetic reordering (grouped-GEMM token grouping, GDN chunk offsets), which is "
+        "benign but not bitwise; this varies only information content, so any difference at "
+        "all is a real leak regardless of dtype.",
+    )
+    parser.add_argument(
+        "--fake-balanced-gate",
+        action="store_true",
+        help="Bypass MoE routing. In bf16 a router score can round differently in a packed "
+        "batch than in a solo one, flipping a token's top-k experts and changing its output "
+        "by O(0.1) with no information crossing a document boundary. Use this to tell that "
+        "apart from a real leak: if the mismatch disappears here, it was the router.",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -151,7 +169,13 @@ def main() -> None:
     atol = args.atol if args.atol is not None else (2e-2 if dtype is torch.bfloat16 else 1e-4)
 
     text_config, moe_config = _build_configs(args.hidden, args.head_dim, list(args.layers))
-    backend = BackendConfig(attn=args.attn, linear="torch", rms_norm="torch", rope_fusion=False)
+    backend = BackendConfig(
+        attn=args.attn,
+        linear="torch",
+        rms_norm="torch",
+        rope_fusion=False,
+        fake_balanced_gate=args.fake_balanced_gate,
+    )
 
     torch.manual_seed(0)
     blocks = torch.nn.ModuleList(
@@ -207,7 +231,15 @@ def main() -> None:
     print(f"backend={args.attn} device={device} dtype={args.dtype} layers={args.layers}")
     print(f"pack: {len(doc_lens)} documents {doc_lens} + {args.pad} padding = {total} tokens, atol={atol}")
 
-    failures = 0
+    # Two distinct questions, kept apart because they fail for different reasons:
+    #   drift  -- packed vs solo. Mathematically equivalent but not bitwise: grouped-GEMM
+    #             token grouping and GDN chunk offsets both reorder arithmetic. In bf16 that
+    #             reordering exceeds any absolute atol worth setting (one bf16 ulp at these
+    #             activation magnitudes is already ~1e-2), so drift is a gate only in fp32.
+    #   leak   -- neighbour perturbation. Layout held fixed, only other documents' content
+    #             varies, so this is bitwise and is a gate in every dtype.
+    drift_failures = 0
+    leak_failures = 0
     for index, (start, end) in enumerate(bounds, start=1):
         length = end - start
         solo_ids = torch.ones(1, length, dtype=torch.long, device=device)
@@ -224,19 +256,67 @@ def main() -> None:
                     **solo_extra,
                 )
 
-        delta = (packed[:, start:end].float() - solo.float()).abs().max().item()
-        status = "ok" if delta <= atol else "LEAK"
+        diff = (packed[:, start:end].float() - solo.float()).abs()
+        delta = diff.max().item()
+        # Per-token, so one flipped router decision is distinguishable from a broad leak.
+        bad_tokens = int((diff.amax(dim=-1) > atol).sum().item())
+        status = "ok" if delta <= atol else "DRIFT"
         if status != "ok":
-            failures += 1
-        print(f"  document {index}: tokens={length:5d} max|packed - standalone| = {delta:.3e}  {status}")
+            drift_failures += 1
+        print(
+            f"  document {index}: tokens={length:5d} max|packed - standalone| = {delta:.3e}  "
+            f"{status} ({bad_tokens}/{length} tokens above atol)"
+        )
 
     if args.pad:
         # Padding is not a document; it must not pick up content from one.
         tail = packed[:, sum(doc_lens) :]
         print(f"  padding tail: max|value| = {tail.float().abs().max().item():.3e} (informational)")
 
-    if failures:
-        raise SystemExit(f"{failures}/{len(doc_lens)} documents differ when packed - attention or state leaks")
+    if args.perturb_neighbors:
+        print("\nneighbour-perturbation test (bitwise; any difference is a leak):")
+        for index, (start, end) in enumerate(bounds, start=1):
+            # Same lengths, same offsets, same execution order -- only the OTHER documents'
+            # content changes, so arithmetic reordering is held constant.
+            perturbed_inputs = hidden_states.clone()
+            for other, (o_start, o_end) in enumerate(bounds, start=1):
+                if other != index:
+                    perturbed_inputs[:, o_start:o_end] = torch.randn_like(perturbed_inputs[:, o_start:o_end])
+            perturbed = perturbed_inputs
+            with torch.no_grad():
+                for block in blocks:
+                    perturbed = block(
+                        perturbed,
+                        freqs_cis=freqs_cis,
+                        attention_mask=packed_mask,
+                        padding_mask=document_ids.eq(0),
+                        position_ids=position_ids,
+                        **packed_extra,
+                    )
+            delta = (packed[:, start:end].float() - perturbed[:, start:end].float()).abs().max().item()
+            status = "ok" if delta == 0.0 else "LEAK"
+            if status != "ok":
+                leak_failures += 1
+            print(f"  document {index}: max|change when neighbours are replaced| = {delta:.3e}  {status}")
+
+    if leak_failures:
+        raise SystemExit(
+            f"{leak_failures}/{len(doc_lens)} documents changed when their neighbours changed - "
+            "information crosses a document boundary"
+        )
+    if drift_failures and dtype is not torch.bfloat16:
+        raise SystemExit(
+            f"{drift_failures}/{len(doc_lens)} documents differ beyond atol between the packed and "
+            "solo forwards in a dtype where that cannot be rounding - attention or state leaks"
+        )
+    if drift_failures:
+        print(
+            f"\nnote: {drift_failures}/{len(doc_lens)} documents drifted beyond atol={atol} in bfloat16. "
+            "That is arithmetic reordering, not leakage - rerun with --dtype float32 to confirm, and "
+            "read --perturb-neighbors as the authoritative result."
+        )
+    if not args.perturb_neighbors:
+        print("\nnote: --perturb-neighbors was not run, so leakage itself was never tested directly.")
     print(f"\nOK - all {len(doc_lens)} documents are unaffected by being packed together")
 
 

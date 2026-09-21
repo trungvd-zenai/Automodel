@@ -4,12 +4,20 @@ What to run, in order, to qualify the packing change before it goes near a 4-nod
 Companion to `RUNBOOK.md`; everything there about the environment (§5), Blackwell
 attention (§6) and the failure catalogue (§8) still applies. §13.5 records the design.
 
-**State of the change:** all CPU-testable parts are green. Nothing has run on a GPU.
-Three things are unverified by construction and this document is how they get settled:
+**State of the change: all rungs below passed on 2 × B300 on 2026-09-21** (v5_130k,
+`ep_size 2`, 50 steps). RUNBOOK §13.5 carries the measured table. The three questions this
+document existed to settle are settled:
 
-1. Whether TE accepts the packed `cu_seqlens` / THD route on SM 10.x at `head_dim 256`.
-2. Whether the 30 GatedDeltaNet layers stay document-isolated with the real FLA kernels.
-3. What a packed step actually costs in memory and wall-clock.
+1. TE takes the packed `cu_seqlens` / THD route on SM 10.x at `head_dim 256` —
+   `Selected backend = FusedAttention (sub-backend 1)` with TE 2.18.0 + cuDNN 9.26.0.
+2. The 30 GatedDeltaNet layers stay document-isolated with the real FLA kernels — bitwise,
+   see P3 below.
+3. A packed step costs **118.6 GiB** (`torch`) / **147.6 GiB** (`nvidia-smi` peak) and
+   **11.6–12.7 s** at `pack_size 40960`, `lbs 1`, on two GPUs.
+
+Re-run P0–P3 after any change to the model, the collater, or the TE version. Two bugs that
+only a GPU could find (int32 `cu_seqlens`, 2-D TE `thd` output) were caught here and are now
+pinned by unit tests.
 
 A fourth is diagnostic only, and worth answering while a box is available: whether TE
 *raises* on the malformed 6-D mask the old code produced, or silently accepts it. If it
@@ -165,29 +173,72 @@ reset.
 > layers could not be checked without a real `causal_conv1d` build, so P3 is the first
 > time that half runs at all.
 
+**`--perturb-neighbors` is the authoritative test, and it is not optional.** Packed-vs-solo
+conflates leakage with *arithmetic reordering*: grouped-GEMM token grouping and GDN chunk
+offsets reorder accumulation, changing rounding without moving information. In bf16 that
+reaches 0.125 on a document — above any absolute `atol` worth setting, since one bf16 ulp at
+these activation magnitudes is already ~1e-2 — so the packed-vs-solo check reports benign
+drift as a failure. `--perturb-neighbors` holds every length and offset fixed and replaces
+only the *content* of the other documents, so it is bitwise and any difference at all is a
+leak. Measured 2026-09-21:
+
+| run | packed vs solo | neighbour perturbation |
+|---|---|---|
+| `te` fp32 | 1.144e-05 / 6.616e-06 / 9.820e-06 ok | **0.000e+00 all three** |
+| `sdpa` fp32 | 1.156e-05 / 6.586e-06 / 9.820e-06 ok | **0.000e+00 all three** |
+| `te` bf16 | 0.000 / **0.125 DRIFT** (4/61 tokens) / 0.000 | **0.000e+00 all three** |
+| `sdpa` bf16 | 0.000 / **0.125 DRIFT** (4/61 tokens) / 0.000 | **0.000e+00 all three** |
+
+The script now exits non-zero on a `LEAK` in any dtype, and on `DRIFT` only in fp32, where a
+difference cannot be rounding. Do not "fix" a bf16 `DRIFT` by loosening `atol`; confirm it in
+fp32 instead. Note also that `--fake-balanced-gate` is **not** a valid control here: it routes
+experts by position, so it deliberately breaks packed/solo equivalence.
+
 ### P4 — smoke run, 2 × B300
 
 The packed recipe is a 4-node / 32-GPU config; on two GPUs override the parallelism. With
 `world_size 2`, `ep_size 2` keeps `256 % ep_size == 0` and `dp_size × cp_size % ep_size == 0`.
 
-Start small so iteration is fast — correctness first, shape later:
+Start small so iteration is fast — correctness first, shape later. **Shrink the corpus,
+not `pack_size`.** Lowering `pack_size` against the full corpus is silently wrong: the VLM
+neat packer books an over-long row into a bin at a *clamped* planning length
+(`est_len = min(est_len, knapsack_capacity)`, `neat_packing_vlm.py:817`) and only learns the
+real length in `__getitem__`, where it drops the sample with a bare `logger.warning`
+(`:584`); a bin that held only that sample returns a **padding-only pack** (`:616`). The LLM
+packer raises in this situation (`llm/neat_packing.py:197`), the VLM one does not. On
+v5_130k (p50 3,349 / mean 4,664) `pack_size 4096` would discard about half the corpus and
+make `num_label_tokens` — the one number this rung reads — meaningless.
+
+There is no valid `pack_size` below 40,960 for the full corpus, because the pre-filter cap
+*is* 40,960 and rows run up to it. So build a short-row subset instead, capped low enough
+that nothing can be dropped and high enough that several documents still share a pack —
+one-document packs would not exercise the cross-document path this rung is here to test:
 
 ```bash
 set -a; . ./.env; set +a
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+python examples/vlm_finetune/qwen3_5_moe/affine/make_short_subset.py \
+    --src data/v5_130k_filtered --out data/v5_130k_short --max-tokens 1000
+
 NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 \
 automodel examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_4node_ep8_packed.yaml \
   --nproc-per-node 2 \
   --distributed.ep_size 2 \
+  --dataset.path_or_dataset data/v5_130k_short/train.parquet \
+  --validation_dataset.path_or_dataset data/v5_130k_short/val.parquet \
   --packed_sequence.pack_size 4096 \
   --packed_sequence.collate_max_length 4096 \
+  --packed_sequence.drop_long_samples true \
   --step_scheduler.local_batch_size 1 \
   --step_scheduler.global_batch_size 2 \
   --step_scheduler.max_steps 5 \
   --lr_scheduler.lr_warmup_steps 1 \
   --checkpoint.enabled false 2>&1 | tee smoke_packed.log
 ```
+
+`drop_long_samples true` is belt-and-braces: with the subset nothing should exceed the pack,
+and if anything does it is dropped during planning rather than turning into padding.
 
 Check **all** of these, not just that it ran:
 
@@ -289,16 +340,34 @@ it is the only check that catches a silent leak.
 | P3 leaks on both | the packing metadata itself, or `_packed_seq_ids` not reaching the block |
 | Bimodal step times persist | `collate_max_length` not applied, so pack shapes still vary (§8.5) |
 | `pixel_values` in a text-only batch | `dataset.inject_fake_images` reverted to its `true` default |
+| `num_label_tokens` far LOWER than expected, or a NaN/zero loss | `pack_size` is below the longest row, so rows are being dropped in `__getitem__` and some packs are padding-only. Raise `pack_size` to the pre-filter cap or shrink the corpus (P4) |
+| `Selected backend` says `FusedAttention=False` despite installing cuDNN 9.26 | a later resolving `uv pip install` reverted it: torch 2.10.0+cu130 pins `nvidia-cudnn-cu13==9.15.1.9` **exactly**. Reinstall cuDNN last with `--no-deps` and re-check `torch.backends.cudnn.version() >= 92300` |
 
 ---
 
 ## 4. What to hand back
 
-Enough to update RUNBOOK §13.5 from "implemented, not yet run" to a measured entry:
+**Done for v5_130k on 2026-09-21; RUNBOOK §13.5 holds the measured table.** What was
+recorded, and what to record again for a different corpus or TE version:
 
-- TE and cuDNN versions, and the `Selected backend` line.
-- P1's FLA signature, and the answer to the 6-D mask diagnostic.
-- P3's per-document deltas for `te` and `sdpa`, bf16 and fp32.
-- P5's `nvidia-smi` peak, s/step warm, and whether autotune stalls disappeared.
-- The pack count, and the recomputed step schedule.
-- `num_label_tokens` from a packed step, next to the same figure from an unpacked run.
+- TE 2.18.0 / cuDNN 9.26.0 / sm103, `Selected backend = FusedAttention (sub-backend 1)`.
+- FLA exposes both `cu_seqlens` and `cu_seqlens_cpu`. **6-D mask diagnostic: TE raises.** A
+  2-D padding mask returns normally; the 4-D block-causal mask and the 6-D tensor the old
+  code built both raise `RuntimeError: Tensors must have same number of dimensions`. So the
+  upstream `neat` recipes switched to `attn: te` crashed rather than bleeding.
+- P3 deltas: see the table in the P3 section.
+- Wall-clock and memory: 11.6–12.7 s/step with no bimodality (the §8.5 autotune stalls are
+  gone), `torch` 118.6 GiB, `nvidia-smi` peak 147.6 GiB of 275 GiB.
+- Pack count: **128,575 rows → 14,644 packs at 100.0% estimated utilization**.
+- `num_label_tokens` on a packed step: mean 4,692, min 1,415, max 10,753 — **5.7%** of the
+  81,920 tokens processed per step, the right order for last-turn-only supervision and far
+  from the ~36× an inert label hook would give.
+
+**Still open, and the reason this is not yet a green light for the full run:** the committed
+step schedule. The measured 14,644 packs give, for 32 GPUs at `lbs 2`,
+`epoch_len = floor(14644/32/2) = 228` → `total_steps 1140`, `wsd_decay_steps 228`,
+`ckpt_every_steps 57` — against the committed 222/55. But those figures are **v5_130k**,
+while `dataset.path_or_dataset` in the config still points at **v6_137k_filtered**, whose
+0.564 B tokens per epoch imply roughly 13,770 packs and `epoch_len` ~215. Decide the corpus
+first, then read the packer's own line from a 1-step run of *that* corpus and apply P6. Do
+not mix the two.

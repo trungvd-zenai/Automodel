@@ -73,6 +73,49 @@ class TestPackedTEAttention:
         assert tuple(recorded["q"].shape) == (5, 2, 4)
         assert out.shape == query.shape
 
+    def test_cu_seqlens_are_int32_for_te(self):
+        """TE asserts int32; the shared metadata is int64 because FLA wants a LongTensor.
+
+        Caught on a real 2xB300 run, where TE raised
+        "cu_seqlens_q and cu_seqlens_q must both be in dtype torch.int32!". Nothing on the
+        CPU path exercises TE, so only an explicit dtype assertion pins this.
+        """
+        recorded: dict = {}
+        attn = _build_attention(recorded)
+        document_ids = torch.tensor([[1, 1, 2, 2, 2, 0]], dtype=torch.long)
+        metadata = prepare_gated_delta_packed_metadata(document_ids, None)
+        # The metadata itself stays int64 for FLA; only the TE call site converts.
+        assert metadata.cu_seqlens.dtype == torch.int64
+
+        query = torch.zeros(1, 6, 2, 4)
+        attn._packed_te_attention(query, query.clone(), query.clone(), metadata)
+
+        assert recorded["kwargs"]["cu_seqlens_q"].dtype == torch.int32
+        assert recorded["kwargs"]["cu_seqlens_kv"].dtype == torch.int32
+
+    def test_two_dimensional_te_output_is_repadded(self):
+        """TE returns [tokens, heads * head_dim] for qkv_format="thd", not a 3-D tensor.
+
+        Caught on 2xB300: the repad indexed attn_output.shape[2] and raised
+        "IndexError: tuple index out of range". The stub backends in these tests return a
+        3-D tensor, so only an explicitly 2-D return reproduces the real TE contract.
+        """
+        recorded: dict = {}
+        attn = _build_attention(recorded)
+        # Collapse heads and head_dim exactly as TE's thd path does.
+        attn._base_attn_func = lambda q, k, v, **kw: q.reshape(q.shape[0], -1)
+
+        document_ids = torch.tensor([[1, 1, 2, 2, 2, 0]], dtype=torch.long)
+        metadata = prepare_gated_delta_packed_metadata(document_ids, None)
+        query = torch.arange(1 * 6 * 2 * 4, dtype=torch.float32).reshape(1, 6, 2, 4)
+
+        out = attn._packed_te_attention(query, query.clone(), query.clone(), metadata)
+
+        # [batch, sequence, heads * head_dim]; the caller reshapes to [batch, sequence, -1].
+        assert tuple(out.shape) == (1, 6, 8)
+        # The padding position stays zero.
+        assert torch.equal(out[0, 5], torch.zeros(8))
+
     def test_repad_restores_valid_positions_and_zeroes_padding(self):
         """Valid positions round-trip unchanged; the padded tail stays zero."""
         recorded: dict = {}

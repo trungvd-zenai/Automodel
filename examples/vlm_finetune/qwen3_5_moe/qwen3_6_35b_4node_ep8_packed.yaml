@@ -69,6 +69,15 @@ step_scheduler:
   # v6_137k is 135,491 train rows / 0.564B rendered tokens per epoch. At pack_size 40,960
   # and an assumed ~97% fill that is ~14,190 packs, i.e. ~443 packs per rank, ~222
   # micro-batches per rank, so epoch_len ~222 optimizer steps and 5 epochs ~1,110 steps.
+  #
+  # MEASURED on 2 x B300, 2026-09-21, but on **v5_130k**, not v6: 128,575 rows ->
+  # 14,644 packs at 100.0% estimated utilization (not 97%). For 32 GPUs at lbs 2 that is
+  # epoch_len = floor(14644/32/2) = 228, total_steps 1,140, wsd_decay_steps 228,
+  # ckpt_every_steps 57, lr_warmup_steps 10.
+  # These numbers are NOT applied below, because `dataset.path_or_dataset` still names
+  # v6_137k_filtered and the pack count is corpus-specific (v6's 0.564B tokens imply
+  # ~13,770 packs, epoch_len ~215). Pick the corpus, run one step, read the packer's
+  # "N samples -> M packs" line, and apply P6 with M.
   # The true pack count is deterministic once the knapsack runs and is logged by the
   # packer at startup. Read it from a 5-step smoke run and recompute:
   #   epoch_len   = floor(packs / 32 / local_batch_size)

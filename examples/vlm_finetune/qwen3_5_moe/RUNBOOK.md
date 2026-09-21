@@ -45,6 +45,7 @@ Each was verified against the source and each fails **silently** if reverted.
 | Hand TE a packed **mask** of any kind | TE's `padding_causal` contract is a 2-D `[batch, sequence]` padding mask. A 4-D block-causal mask silently became 6-D; an indexed document map collapses to a plain padding mask and bleeds across documents with **no error**. The packed recipe routes TE through `qkv_format="thd"` + `cu_seqlens` instead, and `components/attention/utils.py` now raises on a non-2-D mask. |
 | Enable packing without `packed_sequence.label_post_hook_fn` | Packing forces pretokenization and selects the packed collater, so `dataloader.collate_fn` is **silently ignored** (`vlm/loader.py:341` precedes `:376`) and `last_turn_collate_fn` never runs. Labels then come from the stock builder, which supervises every assistant turn: ~36x more supervised tokens on this turn-exploded corpus, a different objective, and a plausible-looking loss. |
 | Enable packing without `dataset.inject_fake_images: false` | Pretokenization defaults it to true, so every text-only row gets a synthetic image and is pushed through the frozen vision tower. |
+| Lower `pack_size` below the pre-filter cap | The VLM neat packer books an over-long row at a *clamped* planning length (`neat_packing_vlm.py:817`), then drops it in `__getitem__` with only a `logger.warning` (`:584`); a bin holding just that sample returns a **padding-only pack** (`:616`). The LLM packer raises here, the VLM one does not. Rows run to 40,947, so 40,960 is the floor. For a fast rung shrink the corpus (`affine/make_short_subset.py`), not the pack. |
 | Set `packing_format: thd` on this model | Unwired for the MoE variant: `cp_linear_attn.py:186` unpacks 3 dims from a `[tokens, hidden]` tensor and dies. Use `neat`. |
 | Run without `flash-linear-attention` | GatedDeltaNet falls back to a pure-PyTorch reference path behind a bare `except ImportError`, **no warning** (`qwen3_5_moe/cp_linear_attn.py:126-142`) — silently degrades 30 of 40 layers. |
 | Use `experts: gmm`/`te` without a DeepEP-family dispatcher | `BackendConfig.__post_init__` silently rewrites the pair to `(torch_mm, torch)`. |
@@ -155,6 +156,38 @@ unused here.
   `CUDNN_HOME=<venv>/lib/python3.12/site-packages/nvidia/cudnn` and put the venv's
   `nvidia/cudnn/lib` and `nvidia/nccl/lib` first on `LD_LIBRARY_PATH`, or TE silently
   picks `UnfusedDotProductAttention` (§6).
+
+### Bare-metal on a stock PyTorch image (2 × B300, no Docker, measured 2026-09-21)
+
+Five more traps appear when the host has no CUDA toolkit and no `nemo-automodel` image.
+Provisioned green in ~20 min with these; `examples/.../affine/` carries no installer, so
+they are recorded here.
+
+- **cuDNN reverts silently.** `torch 2.10.0+cu130` declares
+  `nvidia-cudnn-cu13==9.15.1.9` as an **exact** pin, so any resolving `uv pip install`
+  *after* cuDNN 9.26 downgrades it back below the §6 floor — the install log shows
+  `- nvidia-cudnn-cu13==9.26.0.51 / + nvidia-cudnn-cu13==9.15.1.9`. Install cuDNN **last**
+  with `--no-deps` and assert `torch.backends.cudnn.version() >= 92300` rather than
+  trusting it. Left unnoticed this presents as an OOM at `pack_size 40960`, not as a
+  version error.
+- **DeepEP needs rdma-core headers even on one node.** Its IBGDA sources include
+  `<infiniband/mlx5dv.h>`: `apt-get install libibverbs-dev librdmacm-dev`.
+  `DISABLE_NVSHMEM=1` does **not** avoid this on the pinned hybrid-ep commit — the build
+  still passes the nvshmem includes.
+- **The nvshmem wheel has no unversioned soname.** `nvidia-nvshmem-cu13` ships only
+  `libnvshmem_host.so.3`, while DeepEP links `-l:libnvshmem_host.so` (an exact filename),
+  giving `/usr/bin/ld: cannot find -l:libnvshmem_host.so`. Symlink it.
+- **`uv pip install` for DeepEP must run from outside the repo**, as above, but the reason
+  is concrete: `[tool.uv.extra-build-dependencies]` declares
+  `deep_ep = [{ requirement = "torch", match-runtime = true }]`, and with `--no-deps` torch
+  is absent from the resolution, so uv aborts with "`torch` was declared as an extra build
+  dependency with `match-runtime = true`, but was not found in the resolution".
+- **The cuDNN frontend may pick the image's CUDA 12 runtime.** A stock PyTorch image keeps
+  CUDA 12.8 under `/usr/local`, and the frontend warns `Multiple libcudart libraries found
+  ... Using libcudart.so.12`. Export `CUDNN_FRONTEND_CUDART_LIB_NAME=libcudart.so.13`.
+- A stock image also ships an unsigned `/etc/apt/sources.list.d/cuda.list` for the same URL
+  `cuda-keyring` signs, so adding the keyring fails with `E: Conflicting values set for
+  option Signed-By`. Delete the unsigned list first.
 
 ---
 
@@ -598,7 +631,7 @@ world size; on 2 GPUs (EP2) multiply it by 4.
    unique full trajectories and supervising every turn would give equivalent coverage for
    ~a ninth of the compute. The user has been told and chose the current design; do not
    change it unilaterally.
-5. **Sequence packing — implemented, not yet run on GPU.**
+5. **Sequence packing — implemented and measured on 2 × B300 (2026-09-21). Not yet run on 4 nodes.**
    `qwen3_6_35b_4node_ep8_packed.yaml` is `neat` packing with `attn: te` and no
    length-grouped sampler. The earlier rejection rested on three claims, two of them wrong:
 
@@ -629,8 +662,54 @@ world size; on 2 GPUs (EP2) multiply it by 4.
    `last_turn_label_hook`; rung 2 now checks it beside the collator path, and both corpus
    cases of §3 were verified against the real tokenizer.
 
-   Expect a second win: pack shapes are fixed at `collate_max_length`, so FLA's autotune
-   key stops changing every step and the §8.5 stalls should largely disappear.
+   **Second win confirmed:** pack shapes are fixed at `collate_max_length`, so FLA's
+   autotune key stops changing every step. Step times over 50 steps held **11.63–12.7 s**
+   with no bimodality, against the 4 s/31 s split §8.5 measured under length grouping. Only
+   step 0 is an outlier (52.6 s).
+
+   **Measured, 2 × B300, `ep_size 2`, `lbs 1`, `gbs 2`, `pack_size 40960`, v5_130k:**
+
+   | quantity | value |
+   |---|---|
+   | packs | 128,575 rows → **14,644 packs, 100.0% estimated utilization** (the committed step counts assumed ~97% fill) |
+   | TE backend | `Selected backend = FusedAttention (sub-backend 1)`, `qkv_layout thd_thd_thd`, `head_dim_qk 256`, TE 2.18.0 / cuDNN 9.26.0 / sm103 |
+   | step 0 loss | 0.9649 — inside the 0.8–1.8 band, so the state-dict adapter matched |
+   | loss trend | first-10 mean 0.9277 → last-10 mean 0.6980 over 50 steps; final validation 0.6695 |
+   | `num_label_tokens` | min 1,415, max 10,753, mean **4,692** per step = **5.7%** of the 81,920 tokens processed. An inert label hook would supervise every assistant turn (§4: ~36×), which cannot fit inside 81,920 |
+   | memory | `torch` 118.6 GiB steady; **`nvidia-smi` peak 147.6 GiB / 133.5 GiB of 275 GiB** — the EP2-on-2-GPU fixed cost dominates, as predicted |
+   | throughput | ~6,800–7,200 tok/s (~3,400–3,600/GPU) |
+   | clean | no DeepEP `GroupedExperts` fallback, no `pixel_values`, no 2-D-mask guard, no unfused attention |
+
+   **Cross-document parity (P3) passes, but the original test was not sufficient.**
+   Comparing a packed forward against per-document forwards conflates leakage with
+   *arithmetic reordering* — grouped-GEMM token grouping and GDN chunk offsets reorder
+   accumulation, which changes rounding without moving information. In bf16 that reordering
+   reaches 0.125 on a document, above any absolute `atol` worth setting (one bf16 ulp at
+   these activation magnitudes is already ~1e-2), so the check reported benign drift as a
+   leak. `check_packed_parity.py --perturb-neighbors` is now the authoritative test: it holds
+   every length and offset fixed and replaces only the *content* of the other documents, so
+   any difference at all is leakage. Result: **0.000e+00, bitwise, for every document in both
+   backends and both dtypes.** fp32 packed-vs-solo also passes (1.1e-05 / 6.6e-06 / 9.8e-06),
+   and bisecting `--layers` clears the GDN half and the attention half independently. Treat
+   fp32 as the gate and read bf16 drift as informational.
+
+   **The 6-D mask question is answered: TE raises, it does not bleed.** A 2-D
+   `[batch, sequence]` padding mask returns normally, while both the 4-D block-causal mask
+   and the 6-D tensor the old code produced raise `RuntimeError: Tensors must have same
+   number of dimensions`. So anyone who switched the upstream `neat` recipes
+   (`qwen3_5_4b_neat_packing.yaml`, `qwen3_5_35b_neat_packing.yaml`) to `attn: te` got a
+   crash, not silent cross-document attention. The 2-D indexed-map bleed of §2 is unaffected,
+   since a 2-D mask *is* accepted.
+
+   **Two implementation bugs only a GPU could find**, both now pinned by tests in
+   `test_qwen3_5_moe_packed_te_attention.py`:
+
+   - `cu_seqlens` was built int64. TE asserts int32
+     (`dot_product_attention.py:1359`). Converted at the TE call site, not in the shared
+     packed metadata, because FLA's `chunk_gated_delta_rule` takes a `LongTensor`.
+   - The repad assumed a 3-D attention output. TE returns `[tokens, heads * head_dim]` for
+     `qkv_format="thd"`, so `attn_output.shape[2]` raised `IndexError`. Trailing dimensions
+     are now carried through rather than assumed.
 
    **MTP needed a separate fix, in the loss.** `calculate_mtp_loss` masks depth-k targets
    whose rolled source crosses a document boundary, but only when it is given `cu_seqlens`

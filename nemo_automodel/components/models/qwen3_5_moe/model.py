@@ -224,8 +224,10 @@ class _Qwen3_5MoeAttention(Qwen3NextAttention):
                 ``cu_seqlens``.
 
         Returns:
-            Attention output of shape [batch, sequence, heads, head_dim], with padding
-            positions zero-filled.
+            Attention output of shape ``[batch, sequence, *backend_trailing_dims]`` with
+            padding positions zero-filled. TransformerEngine emits ``[tokens, heads *
+            head_dim]`` for ``qkv_format="thd"``, giving ``[batch, sequence, heads *
+            head_dim]`` here.
         """
         if "attention_mask" in attn_kwargs:
             raise ValueError("Packed TE attention derives causality from cu_seqlens; an explicit mask is ambiguous")
@@ -236,6 +238,10 @@ class _Qwen3_5MoeAttention(Qwen3NextAttention):
         # length TE needs costs no device synchronization.
         seqlens = metadata.cu_seqlens_cpu[1:] - metadata.cu_seqlens_cpu[:-1]
         max_seqlen = int(seqlens.max())
+        # TE asserts int32 cu_seqlens (dot_product_attention.py:1359). The shared packed
+        # metadata keeps int64 because FLA's chunk_gated_delta_rule takes a LongTensor, so
+        # convert here rather than changing a dtype all 30 GatedDeltaNet layers depend on.
+        cu_seqlens = metadata.cu_seqlens.to(torch.int32)
 
         def _unpad(tensor: torch.Tensor) -> torch.Tensor:
             heads, head_dim = tensor.shape[2], tensor.shape[3]
@@ -247,19 +253,22 @@ class _Qwen3_5MoeAttention(Qwen3NextAttention):
             _unpad(value),
             qkv_format="thd",
             attn_mask_type="padding_causal",
-            cu_seqlens_q=metadata.cu_seqlens,
-            cu_seqlens_kv=metadata.cu_seqlens,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
             **attn_kwargs,
         )
 
-        # Scatter [tokens, heads, head_dim] back into [batch, sequence, heads, head_dim];
-        # padding positions stay zero and are masked out downstream.
+        # Scatter the dense token stream back into [batch, sequence, ...]; padding positions
+        # stay zero and are masked out downstream. TE returns [tokens, heads * head_dim] in
+        # thd layout -- 2-D, not [tokens, heads, head_dim] -- so the trailing dimensions are
+        # carried through rather than assumed. The caller only needs something reshapeable
+        # to [batch, sequence, -1] (qwen3_next/layers.py:380).
         flat = attn_output.reshape(attn_output.shape[0], -1)
         padded = torch.zeros(batch * seq_len, flat.shape[-1], dtype=flat.dtype, device=flat.device)
         padded.index_copy_(0, indices, flat)
-        return padded.reshape(batch, seq_len, attn_output.shape[1], attn_output.shape[2])
+        return padded.reshape(batch, seq_len, *attn_output.shape[1:])
 
 
 class Qwen3_5MoeBlock(Block):
